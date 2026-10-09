@@ -132,3 +132,4 @@ class SegmentManager:
         self._save_tombstones()
 
         return purged_count
+

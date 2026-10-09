@@ -83,3 +83,4 @@ class FusedHammingKernel:
             order = partition[np.argsort(dists[partition])]
 
         return order, dists[order]
+

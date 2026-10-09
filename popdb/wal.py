@@ -70,8 +70,8 @@ class WALManager:
         self._current_tx_id += 1
         return self._current_tx_id
 
-    def _write_record(self, tx_id: int, op_type: int, payload: bytes) -> None:
-        """Write framed, checksummed record and execute fsync."""
+    def _write_record_buffered(self, tx_id: int, op_type: int, payload: bytes) -> None:
+        """Write framed, checksummed record into memory buffer without fsync."""
         crc = zlib.crc32(payload) & 0xFFFFFFFF
         record_len = len(payload)
         header = struct.pack(">4sIQB", self.RECORD_MAGIC, record_len, tx_id, op_type)
@@ -80,13 +80,44 @@ class WALManager:
         self._file.write(header)
         self._file.write(payload)
         self._file.write(footer)
-        self._file.flush()
-        os.fsync(self._file.fileno())
+
+    def sync(self) -> None:
+        """Flush buffer to OS and execute hardware fsync barrier."""
+        if self._file:
+            self._file.flush()
+            os.fsync(self._file.fileno())
+
+    def _write_record(self, tx_id: int, op_type: int, payload: bytes) -> None:
+        """Write framed, checksummed record and execute fsync immediately."""
+        self._write_record_buffered(tx_id, op_type, payload)
+        self.sync()
 
     def begin_transaction(self, tx_id: int, record_count: int) -> None:
         """Log transaction beginning."""
         payload = struct.pack(">I", record_count)
         self._write_record(tx_id, WALRecordType.BEGIN, payload)
+
+    def _build_insert_payload(
+        self,
+        doc_id: str,
+        text: str,
+        metadata: Dict[str, Any],
+        vector: np.ndarray,
+    ) -> bytes:
+        """Serialize insert payload."""
+        doc_id_bytes = doc_id.encode("utf-8")
+        text_bytes = text.encode("utf-8")
+        meta_bytes = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+        vec_bytes = vector.astype(np.float32).tobytes()
+
+        return (
+            struct.pack(">HI", len(doc_id_bytes), len(text_bytes))
+            + doc_id_bytes
+            + text_bytes
+            + struct.pack(">II", len(meta_bytes), len(vec_bytes))
+            + meta_bytes
+            + vec_bytes
+        )
 
     def log_insert(
         self,
@@ -97,22 +128,30 @@ class WALManager:
         vector: np.ndarray,
     ) -> None:
         """Log record insert with vector bytes."""
-        doc_id_bytes = doc_id.encode("utf-8")
-        text_bytes = text.encode("utf-8")
-        meta_bytes = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
-        vec_bytes = vector.astype(np.float32).tobytes()
-
-        # Payload format:
-        # [id_len: uint16][id_bytes][text_len: uint32][text_bytes][meta_len: uint32][meta_bytes][vec_len: uint32][vec_bytes]
-        payload = (
-            struct.pack(">HI", len(doc_id_bytes), len(text_bytes))
-            + doc_id_bytes
-            + text_bytes
-            + struct.pack(">II", len(meta_bytes), len(vec_bytes))
-            + meta_bytes
-            + vec_bytes
-        )
+        payload = self._build_insert_payload(doc_id, text, metadata, vector)
         self._write_record(tx_id, WALRecordType.INSERT, payload)
+
+    def log_batch_insert(
+        self,
+        tx_id: int,
+        items: List[Tuple[str, str, Dict[str, Any], np.ndarray]],
+    ) -> None:
+        """Log an entire batch of inserts within a single atomic fsync barrier.
+        
+        Args:
+            tx_id: Transaction ID.
+            items: List of (doc_id, text, metadata, vector) tuples.
+        """
+        payload_begin = struct.pack(">I", len(items))
+        self._write_record_buffered(tx_id, WALRecordType.BEGIN, payload_begin)
+
+        for doc_id, text, metadata, vector in items:
+            payload_insert = self._build_insert_payload(doc_id, text, metadata, vector)
+            self._write_record_buffered(tx_id, WALRecordType.INSERT, payload_insert)
+
+        payload_commit = struct.pack(">Q", tx_id)
+        self._write_record_buffered(tx_id, WALRecordType.COMMIT, payload_commit)
+        self.sync()
 
     def log_delete(self, tx_id: int, doc_id: str) -> None:
         """Log soft-delete tombstone record."""

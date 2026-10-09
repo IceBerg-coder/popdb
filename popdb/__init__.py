@@ -3,9 +3,12 @@
 from popdb.bm25 import BM25Index
 from popdb.client import EmbeddingGemmaClient
 from popdb.columnar import ColumnarIndex
+from popdb.concurrency import RWLock
 from popdb.engine import Engine
 from popdb.filter import MetadataFilter
+from popdb.ivf import IVFBQIndex
 from popdb.kernel import FusedHammingKernel
+from popdb.prefetch import OSMemoryPrefetcher
 from popdb.quantization import ScalarQuantizer2Bit
 from popdb.retriever import HierarchicalRetriever
 from popdb.storage import StorageEngine
@@ -19,6 +22,9 @@ __all__ = [
     "ColumnarIndex",
     "FusedHammingKernel",
     "ScalarQuantizer2Bit",
+    "IVFBQIndex",
+    "OSMemoryPrefetcher",
+    "RWLock",
     "HierarchicalRetriever",
     "StorageEngine",
     "MetadataFilter",

@@ -309,6 +309,40 @@ def run_demo() -> None:
         print(f"   vectors.bin shrank from {pre_vec_size:,} bytes to {post_vec_size:,} bytes.")
         print(f"   Active database count: {db_reloaded.count()} documents.")
 
+        # =========================================================================
+        # STEP 7: High-Throughput Bulk Ingestion, IVF-BQ & Concurrent Batch Search
+        # =========================================================================
+        print_banner("Step 7: High-Speed Bulk Ingestion, IVF-BQ & Concurrent Batch Search")
+        print("1. Ingesting batch of documents using bulk_insert()...")
+        bulk_docs = [
+            {"text": f"High performance distributed vector search node {i} with hardware acceleration", "metadata": {"node": i, "cluster": "alpha"}}
+            for i in range(16)
+        ]
+        t_bulk_start = time.perf_counter()
+        bulk_ids = db_reloaded.bulk_insert(bulk_docs, batch_size=8)
+        t_bulk_ms = (time.perf_counter() - t_bulk_start) * 1000.0
+        print(f"   [OK] Ingested {len(bulk_ids)} documents in {t_bulk_ms:.2f} ms. Total count: {db_reloaded.count()}")
+
+        print("\n2. Training IVF-BQ Voronoi cluster inverted index...")
+        db_reloaded.build_ivf(k=4, n_probe=2)
+        print(f"   [Trained] IVF-BQ: K={db_reloaded.storage.ivf.k} clusters, n_probe={db_reloaded.storage.ivf.n_probe}")
+        print(f"   OS Page Prefetcher Available: {db_reloaded.storage.prefetcher.is_available}")
+
+        print("\n3. Executing concurrent multi-threaded batch search across worker threads...")
+        queries = [
+            "vector search node clustering",
+            "hardware acceleration and SIMD",
+            "PostgreSQL ACID durability logging",
+        ]
+        t_batch_start = time.perf_counter()
+        batch_results = db_reloaded.batch_search(queries, top_k=2, max_workers=3)
+        t_batch_ms = (time.perf_counter() - t_batch_start) * 1000.0
+        print(f"   [OK] Processed {len(queries)} concurrent queries in {t_batch_ms:.2f} ms:")
+        for q, res_list in zip(queries, batch_results):
+            top_match = res_list[0] if res_list else None
+            top_text = top_match.text[:60] + "..." if top_match else "None"
+            print(f"    • Query: '{q}' -> Top: [ID: {top_match.id if top_match else 'N/A'}] {top_text}")
+
     print_banner("Demonstration Completed Successfully!")
 
 

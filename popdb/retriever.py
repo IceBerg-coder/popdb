@@ -35,6 +35,8 @@ class HierarchicalRetriever:
         candidate_k: int = 500,
         tier2_k: int = 50,
         return_stats: bool = False,
+        use_ivf: bool = True,
+        n_probe: Optional[int] = None,
     ) -> Tuple[List[SearchResult], Optional[TierStats]]:
         """Run 3-tier cascading search.
         
@@ -45,6 +47,8 @@ class HierarchicalRetriever:
             candidate_k: Number of candidates retained from Tier 1 (default: 500).
             tier2_k: Number of candidates retained from Tier 2 (default: 50).
             return_stats: If True, return timing and candidate telemetry.
+            use_ivf: If True and IVF index trained, probe nearest clusters.
+            n_probe: Number of nearest IVF clusters to probe.
             
         Returns:
             Tuple of (results_list, optional_tier_stats).
@@ -71,6 +75,16 @@ class HierarchicalRetriever:
         # Apply tombstone soft-delete mask
         if self.storage.segment_mgr.tombstones:
             mask &= self.storage.segment_mgr.get_active_mask(self.storage.offset_to_id)
+
+        # Apply IVF Voronoi cluster probing mask if trained
+        if use_ivf and self.storage.ivf.is_trained:
+            ivf_offsets = self.storage.ivf.probe(query_vector, n_probe=n_probe)
+            if len(ivf_offsets) > 0:
+                ivf_mask = np.zeros(n_physical, dtype=bool)
+                ivf_mask[ivf_offsets] = True
+                combined = mask & ivf_mask
+                if np.any(combined):
+                    mask = combined
 
         eligible_indices = np.flatnonzero(mask)
 
@@ -124,6 +138,9 @@ class HierarchicalRetriever:
                 order1_5 = part1_5[np.argsort(-sq2_scores[part1_5])]
             t1_survivor_indices = [t1_survivor_indices[i] for i in order1_5]
             t1_survivor_hamming = [t1_survivor_hamming[i] for i in order1_5]
+
+        # Prefetch surviving candidates into OS page cache before disk reads
+        self.storage.prefetch_candidates(t1_survivor_indices)
 
         # =====================================================================
         # TIER 2: Matryoshka 256d Dot Product via Zero-Copy Memmap Slice
@@ -219,6 +236,8 @@ class HierarchicalRetriever:
         rrf_constant: int = 60,
         dense_weight: float = 1.0,
         sparse_weight: float = 1.0,
+        use_ivf: bool = True,
+        n_probe: Optional[int] = None,
     ) -> List[HybridResult]:
         """Perform Hybrid Search fusing Dense Retrieval and BM25 via Reciprocal Rank Fusion.
         
@@ -237,6 +256,8 @@ class HierarchicalRetriever:
             rrf_constant: Smoothing factor k (default: 60).
             dense_weight: Multiplier for dense rank contribution.
             sparse_weight: Multiplier for sparse rank contribution.
+            use_ivf: If True and IVF trained, probe nearest clusters.
+            n_probe: Number of nearest IVF clusters to probe.
             
         Returns:
             List of HybridResult items ranked by fused RRF score.
@@ -248,6 +269,8 @@ class HierarchicalRetriever:
             filter_predicate=filter_predicate,
             candidate_k=candidate_k,
             tier2_k=tier2_k,
+            use_ivf=use_ivf,
+            n_probe=n_probe,
         )
 
         # 2. Run BM25 search with metadata pushdown and tombstones

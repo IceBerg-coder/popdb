@@ -220,3 +220,4 @@ class ColumnarIndex:
                 raise ValueError(f"Unsupported operator in columnar filter: {op}")
 
         return mask
+

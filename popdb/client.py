@@ -105,37 +105,51 @@ class EmbeddingGemmaClient:
             vectors = vectors / norms
         return vectors
 
+    def encode_queries(
+        self,
+        queries: Sequence[str],
+        batch_size: int = 32,
+        normalize_embeddings: bool = True,
+    ) -> np.ndarray:
+        """Encode multiple search queries using task-specific instruction prefix: prompt_name="SearchQuery".
+        
+        Args:
+            queries: Sequence of query text strings.
+            batch_size: Mini-batch size for query inference.
+            normalize_embeddings: If True, L2-normalize vectors to unit hypersphere.
+            
+        Returns:
+            np.ndarray of shape (N, 768) with dtype float32.
+        """
+        if not queries:
+            return np.empty((0, self.FULL_DIM), dtype=np.float32)
+
+        if self.use_mock:
+            return self._mock_encode(queries, prefix="SearchQuery", normalize=normalize_embeddings)
+
+        self._load_model()
+        vectors = self._model.encode(
+            list(queries),
+            prompt_name=self.QUERY_PROMPT,
+            normalize_embeddings=normalize_embeddings,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        vectors = vectors.astype(np.float32)
+        if normalize_embeddings:
+            norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            vectors = vectors / norms
+        return vectors
+
     def encode_query(
         self,
         query: str,
         normalize_embeddings: bool = True,
     ) -> np.ndarray:
-        """Encode search query using task-specific instruction prefix: prompt_name="SearchQuery".
-        
-        Args:
-            query: Query text string.
-            normalize_embeddings: If True, L2-normalize vector to unit hypersphere.
-            
-        Returns:
-            np.ndarray of shape (768,) with dtype float32.
-        """
-        if self.use_mock:
-            return self._mock_encode([query], prefix="SearchQuery", normalize=normalize_embeddings)[0]
-
-        self._load_model()
-        vectors = self._model.encode(
-            [query],
-            prompt_name=self.QUERY_PROMPT,
-            normalize_embeddings=normalize_embeddings,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-        q = vectors[0].astype(np.float32)
-        if normalize_embeddings:
-            q_norm = np.linalg.norm(q)
-            if q_norm > 0:
-                q = q / q_norm
-        return q
+        """Encode single search query using prompt_name="SearchQuery"."""
+        return self.encode_queries([query], batch_size=1, normalize_embeddings=normalize_embeddings)[0]
 
     @classmethod
     def truncate_mrl(cls, vectors: np.ndarray, dim: int = 256) -> np.ndarray:

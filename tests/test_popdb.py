@@ -363,3 +363,76 @@ class TestOptimizationModules:
         exact = np.dot(v, q)
         corr = np.corrcoef(scores, exact)[0, 1]
         assert corr > 0.8  # Strong correlation > 80% with 2-bit codes
+
+    def test_ivf_bq_index(self):
+        from popdb.ivf import IVFBQIndex
+        rng = np.random.RandomState(42)
+        vecs = rng.randn(60, 768).astype(np.float32)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+
+        ivf = IVFBQIndex(k=6, n_probe=2)
+        ivf.train(vecs)
+        assert ivf.is_trained
+        assert ivf.centroids.shape == (6, 768)
+
+        # Probe nearest clusters
+        q = rng.randn(768).astype(np.float32)
+        q /= np.linalg.norm(q)
+        candidates = ivf.probe(q, n_probe=2)
+        assert len(candidates) > 0
+        assert len(candidates) < 60  # Effectively partitioned
+
+        # Dynamic add and remove
+        ivf.add(60, q)
+        assert 60 in ivf.doc_clusters
+        ivf.remove(60)
+        assert 60 not in ivf.doc_clusters
+
+    def test_os_memory_prefetcher(self):
+        from popdb.prefetch import OSMemoryPrefetcher
+        prefetcher = OSMemoryPrefetcher()
+        # Ensure it initializes safely across platforms
+        assert isinstance(prefetcher.is_available, bool)
+
+        temp_arr = np.zeros((10, 768), dtype=np.float32)
+        # Should not raise exception
+        res = prefetcher.prefetch(temp_arr, [0, 1, 2])
+        assert isinstance(res, bool)
+
+    def test_bulk_insert_and_concurrency(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with Engine(temp_dir, use_mock_client=True) as db:
+                # 1. Bulk insert
+                docs = [
+                    {"text": f"Document number {i} discussing vector DB architecture", "metadata": {"idx": i, "even": (i % 2 == 0)}}
+                    for i in range(25)
+                ]
+                doc_ids = db.bulk_insert(docs, batch_size=10)
+                assert len(doc_ids) == 25
+                assert db.count() == 25
+
+                # Build IVF index on the 25 documents
+                db.build_ivf(k=4, n_probe=2)
+                assert db.storage.ivf.is_trained
+
+                # 2. Multi-threaded batch search
+                queries = [
+                    "vector DB architecture",
+                    "document indexing",
+                    "concurrency performance",
+                ]
+                batch_results = db.batch_search(queries, top_k=3, max_workers=3)
+                assert len(batch_results) == 3
+                for r_list in batch_results:
+                    assert len(r_list) <= 3
+                    assert len(r_list) > 0
+
+                # 3. Batch search with filter
+                filtered_batch = db.batch_search(queries, top_k=3, filter={"even": True}, max_workers=2)
+                for r_list in filtered_batch:
+                    for r in r_list:
+                        assert r.metadata["even"] is True
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+

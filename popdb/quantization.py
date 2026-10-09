@@ -107,3 +107,4 @@ class ScalarQuantizer2Bit:
 
         # Compute dot product
         return np.dot(reconstructed, query_256)
+

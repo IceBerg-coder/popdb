@@ -7,6 +7,8 @@ import numpy as np
 
 from popdb.client import EmbeddingGemmaClient
 from popdb.columnar import ColumnarIndex
+from popdb.ivf import IVFBQIndex
+from popdb.prefetch import OSMemoryPrefetcher
 from popdb.quantization import ScalarQuantizer2Bit
 from popdb.segment import SegmentManager
 from popdb.wal import WALManager
@@ -23,6 +25,8 @@ class StorageEngine:
     In-memory indexes:
     - bitmask_index: (N, 96) uint8 array (1 byte per 8 dimensions = 96 bytes/vector).
     - sq2_index: (N, 64) uint8 array for 2-bit scalar quantized MRL 256d vectors.
+    - ivf: Inverted File Binary Quantization (IVFBQIndex) for clustered probing.
+    - prefetcher: OS-level asynchronous page prefetcher (PrefetchVirtualMemory / madvise).
     - columnar: High-performance Columnar Inverted Bitset Index for microsecond metadata filtering.
     - metadata_cache: List of metadata dicts for predicate pushdown evaluation.
     - id_to_offset: Map of document string IDs to contiguous row indices.
@@ -43,6 +47,8 @@ class StorageEngine:
         self.wal = WALManager(self.wal_path)
         self.columnar = ColumnarIndex()
         self.segment_mgr = SegmentManager(db_dir)
+        self.prefetcher = OSMemoryPrefetcher()
+        self.ivf = IVFBQIndex(k=16, n_probe=4)
         self._memmap: Optional[np.memmap] = None
         self._vector_file = None
         self._metadata_file = None
@@ -202,21 +208,16 @@ class StorageEngine:
 
         vectors = np.ascontiguousarray(vectors, dtype=np.float32)
 
-        # 1. WAL Phase: write and fsync transaction log
+        # 1. WAL Phase: write and fsync transaction log atomically in one batch
         tx_id = self.wal.next_tx_id()
-        self.wal.begin_transaction(tx_id, n)
-        for i in range(n):
-            self.wal.log_insert(
-                tx_id,
-                doc_ids[i],
-                texts[i],
-                metadatas[i],
-                vectors[i],
-            )
-        self.wal.commit_transaction(tx_id)
+        wal_items = [
+            (doc_ids[i], texts[i], metadatas[i], vectors[i])
+            for i in range(n)
+        ]
+        self.wal.log_batch_insert(tx_id, wal_items)
 
         # 2. Main Storage Append Phase
-        start_offset = self.count
+        start_offset = len(self.offset_to_id)
         offsets = list(range(start_offset, start_offset + n))
 
         with open(self.vectors_path, "ab") as vf, open(self.metadata_path, "a", encoding="utf-8") as mf:
@@ -254,11 +255,13 @@ class StorageEngine:
             self.offset_to_id.append(d_id)
             self.offset_to_text.append(texts[i])
             self.metadata_cache.append(metadatas[i])
+            if self.ivf.is_trained:
+                self.ivf.add(offset, vectors[i])
 
         self.columnar.add_documents(start_offset, metadatas)
 
         # 4. Refresh memmap view
-        self._remap_memmap(self.count)
+        self._remap_memmap(len(self.offset_to_id))
 
         return offsets
 
@@ -315,15 +318,39 @@ class StorageEngine:
             "offset": idx,
         }
 
+    def prefetch_candidates(self, offsets: Sequence[int]) -> bool:
+        """Prefetch memory pages for candidate offsets into OS page cache."""
+        if self._memmap is None or len(offsets) == 0:
+            return False
+        return self.prefetcher.prefetch(self._memmap, offsets, bytes_per_row=self.BYTES_PER_VECTOR)
+
+    def build_ivf(self, k: int = 16, n_probe: int = 4) -> None:
+        """Train and build the IVF-BQ index over current active vectors."""
+        n_physical = len(self.offset_to_id)
+        if n_physical == 0 or self._memmap is None:
+            return
+        active_offsets = [
+            off for off, doc_id in enumerate(self.offset_to_id)
+            if not self.segment_mgr.is_deleted(doc_id)
+        ]
+        if not active_offsets:
+            return
+        active_vecs = np.asarray(self._memmap[active_offsets])
+        self.ivf = IVFBQIndex(k=k, n_probe=n_probe)
+        self.ivf.train(active_vecs, offsets=active_offsets)
+
     def delete(self, doc_id: str) -> bool:
         """Atomically soft-delete a document."""
         if doc_id not in self.id_to_offset or self.segment_mgr.is_deleted(doc_id):
             return False
 
+        idx = self.id_to_offset[doc_id]
         tx_id = self.wal.next_tx_id()
         self.wal.begin_transaction(tx_id, 1)
         self.wal.log_delete(tx_id, doc_id)
         self.wal.commit_transaction(tx_id)
+        if self.ivf.is_trained:
+            self.ivf.remove(idx)
         return self.segment_mgr.mark_deleted(doc_id)
 
     def compact(self) -> int:
