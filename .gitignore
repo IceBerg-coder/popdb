@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing & caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# PopDB local database files & demo data
+popdb_demo_data/
+*.log
+*.bin
+*.jsonl
+
+# Environment & IDE
+.env
+.venv
+env/
+venv/
+.idea/
+.vscode/
