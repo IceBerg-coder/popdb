@@ -13,6 +13,7 @@ class WALRecordType:
     INSERT = 2
     COMMIT = 3
     CHECKPOINT = 4
+    DELETE = 5
 
 
 class WALEntry(NamedTuple):
@@ -112,6 +113,12 @@ class WALManager:
             + vec_bytes
         )
         self._write_record(tx_id, WALRecordType.INSERT, payload)
+
+    def log_delete(self, tx_id: int, doc_id: str) -> None:
+        """Log soft-delete tombstone record."""
+        doc_id_bytes = doc_id.encode("utf-8")
+        payload = struct.pack(">H", len(doc_id_bytes)) + doc_id_bytes
+        self._write_record(tx_id, WALRecordType.DELETE, payload)
 
     def commit_transaction(self, tx_id: int) -> None:
         """Log transaction commit."""

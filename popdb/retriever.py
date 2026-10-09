@@ -7,6 +7,8 @@ import numpy as np
 from popdb.bm25 import BM25Index
 from popdb.client import EmbeddingGemmaClient
 from popdb.filter import MetadataFilter
+from popdb.kernel import FusedHammingKernel
+from popdb.quantization import ScalarQuantizer2Bit
 from popdb.storage import StorageEngine
 from popdb.types import HybridResult, SearchResult, TierStats
 
@@ -47,8 +49,8 @@ class HierarchicalRetriever:
         Returns:
             Tuple of (results_list, optional_tier_stats).
         """
-        n_total = self.storage.count
-        if n_total == 0:
+        n_physical = len(self.storage.offset_to_id)
+        if n_physical == 0:
             stats = TierStats(0, 0, 0, 0.0, 0, 0.0, 0, 0.0, 0.0) if return_stats else None
             return [], stats
 
@@ -59,17 +61,24 @@ class HierarchicalRetriever:
         # =====================================================================
         t1_start = time.perf_counter()
 
-        # 1. Apply metadata pre-filtering directly before Hamming calculations
-        eligible_indices = MetadataFilter.filter_indices(
-            self.storage.metadata_cache,
-            filter_predicate,
-        )
+        # 1. Apply metadata pre-filtering directly via Columnar Inverted Bitsets
+        if filter_predicate:
+            col_mask = self.storage.columnar.evaluate_mask(filter_predicate)
+            mask = col_mask if col_mask is not None else np.ones(n_physical, dtype=bool)
+        else:
+            mask = np.ones(n_physical, dtype=bool)
+
+        # Apply tombstone soft-delete mask
+        if self.storage.segment_mgr.tombstones:
+            mask &= self.storage.segment_mgr.get_active_mask(self.storage.offset_to_id)
+
+        eligible_indices = np.flatnonzero(mask)
 
         n_filtered = len(eligible_indices)
         if n_filtered == 0:
             t_total = (time.perf_counter() - t_start) * 1000.0
             stats = (
-                TierStats(n_total, 0, 0, 0.0, 0, 0.0, 0, 0.0, t_total)
+                TierStats(n_physical, 0, 0, 0.0, 0, 0.0, 0, 0.0, t_total)
                 if return_stats
                 else None
             )
@@ -78,32 +87,43 @@ class HierarchicalRetriever:
         # 2. Quantize query vector to 1-bit packed uint8 (96 bytes)
         query_bits = EmbeddingGemmaClient.quantize_1bit(query_vector)
 
-        # 3. Bitwise XOR and hardware POPCOUNT against in-memory packed bitmasks
-        if n_filtered == n_total:
-            # Full dataset scan
+        # 3. Bitwise XOR and hardware POPCOUNT via Fused SIMD uint64 Kernel
+        if n_filtered == n_physical:
             cand_bits = self.storage.bitmask_index
-            xor_diff = np.bitwise_xor(cand_bits, query_bits)
-            # Hardware POPCOUNT via np.bitwise_count (NumPy 2.x+)
-            hamming_dists = np.bitwise_count(xor_diff).sum(axis=-1)
-            target_indices = np.arange(n_total)
+            target_indices = np.arange(n_physical)
         else:
-            # Pushdown: scan only eligible records
             cand_bits = self.storage.bitmask_index[eligible_indices]
-            xor_diff = np.bitwise_xor(cand_bits, query_bits)
-            hamming_dists = np.bitwise_count(xor_diff).sum(axis=-1)
             target_indices = np.array(eligible_indices, dtype=np.int64)
 
-        # 4. Prune dataset down to candidate_k
-        k1 = min(candidate_k, n_filtered)
-        if n_filtered <= k1:
-            order1 = np.argsort(hamming_dists)
-        else:
-            partition = np.argpartition(hamming_dists, k1)[:k1]
-            order1 = partition[np.argsort(hamming_dists[partition])]
+        order1, t1_hamming_dists = FusedHammingKernel.top_k_hamming(
+            doc_bits_u8=cand_bits,
+            query_bits_u8=query_bits,
+            k=candidate_k,
+        )
 
         t1_survivor_indices = target_indices[order1].tolist()
-        t1_survivor_hamming = hamming_dists[order1].tolist()
+        t1_survivor_hamming = t1_hamming_dists.tolist()
         t1_time = (time.perf_counter() - t1_start) * 1000.0
+
+        # =====================================================================
+        # TIER 1.5: In-Memory 2-Bit Scalar Quantization Asymmetric Filter
+        # =====================================================================
+        # Prunes from candidate_k down to 2 * tier2_k entirely in RAM before disk I/O
+        norm_query_256 = EmbeddingGemmaClient.truncate_mrl(query_vector, dim=EmbeddingGemmaClient.MRL_DIM)
+        if (
+            len(t1_survivor_indices) > tier2_k * 2
+            and self.storage.sq2_index.shape[0] == n_physical
+        ):
+            cand_sq2 = self.storage.sq2_index[t1_survivor_indices]
+            sq2_scores = ScalarQuantizer2Bit.asymmetric_dot_product(cand_sq2, norm_query_256)
+            k1_5 = min(tier2_k * 2, len(t1_survivor_indices))
+            if len(sq2_scores) <= k1_5:
+                order1_5 = np.argsort(-sq2_scores)
+            else:
+                part1_5 = np.argpartition(-sq2_scores, k1_5)[:k1_5]
+                order1_5 = part1_5[np.argsort(-sq2_scores[part1_5])]
+            t1_survivor_indices = [t1_survivor_indices[i] for i in order1_5]
+            t1_survivor_hamming = [t1_survivor_hamming[i] for i in order1_5]
 
         # =====================================================================
         # TIER 2: Matryoshka 256d Dot Product via Zero-Copy Memmap Slice
@@ -174,7 +194,7 @@ class HierarchicalRetriever:
         stats = None
         if return_stats:
             stats = TierStats(
-                total_records=n_total,
+                total_records=n_physical,
                 filtered_records=n_filtered,
                 tier1_candidates=len(t1_survivor_indices),
                 tier1_time_ms=t1_time,
@@ -230,14 +250,18 @@ class HierarchicalRetriever:
             tier2_k=tier2_k,
         )
 
-        # 2. Run BM25 search with metadata pushdown
+        # 2. Run BM25 search with metadata pushdown and tombstones
         candidate_set: Optional[Set[int]] = None
-        if filter_predicate:
-            eligible_list = MetadataFilter.filter_indices(
-                self.storage.metadata_cache,
-                filter_predicate,
-            )
-            candidate_set = set(eligible_list)
+        if filter_predicate or self.storage.segment_mgr.tombstones:
+            n_tot = len(self.storage.offset_to_id)
+            mask = np.ones(n_tot, dtype=bool)
+            if filter_predicate:
+                col_mask = self.storage.columnar.evaluate_mask(filter_predicate)
+                if col_mask is not None:
+                    mask &= col_mask
+            if self.storage.segment_mgr.tombstones:
+                mask &= self.storage.segment_mgr.get_active_mask(self.storage.offset_to_id)
+            candidate_set = set(np.flatnonzero(mask).tolist())
 
         bm25_matches = self.bm25.search(
             query=query_text,

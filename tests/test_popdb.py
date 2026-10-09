@@ -277,5 +277,89 @@ class TestHierarchicalEngine:
                 assert db_reloaded.count() == 6
                 assert db_reloaded.get(new_id)["metadata"]["year"] == 2025
 
+                # 3. Test Soft-Delete and LSM Compaction
+                assert db_reloaded.delete("doc_1") is True
+                assert db_reloaded.count() == 5
+                assert db_reloaded.get("doc_1") is None
+
+                # Search should not return deleted doc_1
+                res_after_del = db_reloaded.search("PostgreSQL WAL", top_k=5)
+                retrieved_ids = [r.id for r in res_after_del]
+                assert "doc_1" not in retrieved_ids
+
+                # Run compaction
+                purged = db_reloaded.compact()
+                assert purged == 1
+                assert db_reloaded.count() == 5
+                assert db_reloaded.get("doc_1") is None
+
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestOptimizationModules:
+    """Tests for the 4 frontier optimizations."""
+
+    def test_columnar_bitset_index(self):
+        from popdb.columnar import ColumnarIndex
+        idx = ColumnarIndex()
+        metas = [
+            {"category": "AI", "year": 2024, "rating": 4.9, "tags": ["mrl", "embeddings"]},
+            {"category": "Database", "year": 2023, "rating": 4.7, "tags": ["wal", "storage"]},
+            {"category": "AI", "year": 2022, "rating": 4.5, "tags": ["nlp"]},
+        ]
+        idx.add_documents(0, metas)
+
+        # Categorical equality
+        mask = idx.evaluate_mask({"category": "AI"})
+        assert mask.tolist() == [True, False, True]
+
+        # Numeric range
+        mask_year = idx.evaluate_mask({"year": {"$gte": 2023}})
+        assert mask_year.tolist() == [True, True, False]
+
+        # Compound $and
+        mask_and = idx.evaluate_mask({"$and": [{"category": "AI"}, {"year": {"$gte": 2024}}]})
+        assert mask_and.tolist() == [True, False, False]
+
+        # List tag inclusion
+        mask_tag = idx.evaluate_mask({"tags": {"$in": ["wal", "redis"]}})
+        assert mask_tag.tolist() == [False, True, False]
+
+    def test_fused_hamming_kernel(self):
+        from popdb.kernel import FusedHammingKernel
+        rng = np.random.RandomState(42)
+        docs = rng.randint(0, 256, size=(100, 96), dtype=np.uint8)
+        query = rng.randint(0, 256, size=(96,), dtype=np.uint8)
+
+        # Baseline uint8
+        xor_expected = np.bitwise_xor(docs, query)
+        expected_dists = np.bitwise_count(xor_expected).sum(axis=-1)
+
+        # Fused kernel
+        actual_dists = FusedHammingKernel.compute_hamming_distances(docs, query)
+        np.testing.assert_array_equal(actual_dists, expected_dists)
+
+        order, top_dists = FusedHammingKernel.top_k_hamming(docs, query, k=10)
+        assert len(order) == 10
+        assert np.all(np.diff(top_dists) >= 0)  # Ascending
+
+    def test_scalar_quantizer_2bit(self):
+        from popdb.quantization import ScalarQuantizer2Bit
+        rng = np.random.RandomState(42)
+        v = rng.randn(20, 256).astype(np.float32)
+        v /= np.linalg.norm(v, axis=-1, keepdims=True)
+
+        packed = ScalarQuantizer2Bit.quantize(v)
+        assert packed.shape == (20, 64)
+        assert packed.dtype == np.uint8
+
+        q = rng.randn(256).astype(np.float32)
+        q /= np.linalg.norm(q)
+
+        scores = ScalarQuantizer2Bit.asymmetric_dot_product(packed, q)
+        assert scores.shape == (20,)
+        # Correlates positively with exact dot products
+        exact = np.dot(v, q)
+        corr = np.corrcoef(scores, exact)[0, 1]
+        assert corr > 0.8  # Strong correlation > 80% with 2-bit codes

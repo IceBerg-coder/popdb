@@ -286,6 +286,29 @@ def run_demo() -> None:
         )
         print(f"\n   [OK] Appended new document '{new_doc_id}' after recovery. New count: {db_reloaded.count()}")
 
+        # =========================================================================
+        # STEP 6: LSM Tombstones & Physical Storage Compaction
+        # =========================================================================
+        print_banner("Step 6: LSM Soft-Deletes & Physical Storage Compaction")
+        print("1. Soft-deleting document 'doc_01' (WAL-backed tombstone)...")
+        deleted = db_reloaded.delete("doc_01")
+        print(f"   [OK] Soft-deleted 'doc_01': success={deleted}. Active count: {db_reloaded.count()}")
+
+        # Search should not return doc_01
+        res_post_del = db_reloaded.search("EmbeddingGemma 2", top_k=5)
+        post_del_ids = [r.id for r in res_post_del]
+        assert "doc_01" not in post_del_ids
+        print("   [Verified] Deleted document excluded from subsequent searches.")
+
+        # Physical compaction
+        print("\n2. Executing physical storage compaction...")
+        pre_vec_size = os.path.getsize(db_reloaded.storage.vectors_path)
+        purged = db_reloaded.compact()
+        post_vec_size = os.path.getsize(db_reloaded.storage.vectors_path)
+        print(f"   [Compacted] Purged {purged} record(s).")
+        print(f"   vectors.bin shrank from {pre_vec_size:,} bytes to {post_vec_size:,} bytes.")
+        print(f"   Active database count: {db_reloaded.count()} documents.")
+
     print_banner("Demonstration Completed Successfully!")
 
 

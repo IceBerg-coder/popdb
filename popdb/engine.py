@@ -290,6 +290,24 @@ class Engine:
         """Fetch document text and metadata by ID."""
         return self.storage.get_document(doc_id)
 
+    def delete(self, doc_id: str) -> bool:
+        """Atomically soft-delete a document with WAL durability."""
+        return self.storage.delete(doc_id)
+
+    def compact(self) -> int:
+        """Perform physical storage compaction: defragment vectors and purge deleted records.
+        
+        Returns:
+            Number of physically purged records.
+        """
+        purged = self.storage.compact()
+        # Re-hydrate BM25 index with cleaned corpus
+        self.bm25 = BM25Index(k1=self.bm25.k1, b=self.bm25.b)
+        if self.storage.count > 0:
+            self.bm25.add_documents(list(range(self.storage.count)), self.storage.offset_to_text)
+        self.retriever.bm25 = self.bm25
+        return purged
+
     def checkpoint(self) -> None:
         """Checkpoint the Write-Ahead Log to optimize disk usage."""
         self.storage.checkpoint()

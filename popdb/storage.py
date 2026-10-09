@@ -6,6 +6,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from popdb.client import EmbeddingGemmaClient
+from popdb.columnar import ColumnarIndex
+from popdb.quantization import ScalarQuantizer2Bit
+from popdb.segment import SegmentManager
 from popdb.wal import WALManager
 
 
@@ -19,6 +22,8 @@ class StorageEngine:
     
     In-memory indexes:
     - bitmask_index: (N, 96) uint8 array (1 byte per 8 dimensions = 96 bytes/vector).
+    - sq2_index: (N, 64) uint8 array for 2-bit scalar quantized MRL 256d vectors.
+    - columnar: High-performance Columnar Inverted Bitset Index for microsecond metadata filtering.
     - metadata_cache: List of metadata dicts for predicate pushdown evaluation.
     - id_to_offset: Map of document string IDs to contiguous row indices.
     """
@@ -36,12 +41,15 @@ class StorageEngine:
         self.wal_path = os.path.join(db_dir, "wal.log")
 
         self.wal = WALManager(self.wal_path)
+        self.columnar = ColumnarIndex()
+        self.segment_mgr = SegmentManager(db_dir)
         self._memmap: Optional[np.memmap] = None
         self._vector_file = None
         self._metadata_file = None
 
         # In-memory structures
         self.bitmask_index: np.ndarray = np.empty((0, self.PACKED_BYTES), dtype=np.uint8)
+        self.sq2_index: np.ndarray = np.empty((0, ScalarQuantizer2Bit.PACKED_BYTES), dtype=np.uint8)
         self.metadata_cache: List[Dict[str, Any]] = []
         self.id_to_offset: Dict[str, int] = {}
         self.offset_to_id: List[str] = []
@@ -51,8 +59,8 @@ class StorageEngine:
 
     @property
     def count(self) -> int:
-        """Total number of committed vectors in database."""
-        return len(self.offset_to_id)
+        """Total number of active (non-deleted) committed vectors in database."""
+        return max(0, len(self.offset_to_id) - len(self.segment_mgr.tombstones))
 
     def _recover_and_initialize(self) -> None:
         """Synchronize disk files, replay uncommitted/committed WAL, and build in-memory indexes."""
@@ -126,19 +134,30 @@ class StorageEngine:
             self.offset_to_text.append(rec.get("text", ""))
             self.metadata_cache.append(rec.get("metadata", {}))
 
-        # Build in-memory 1-bit packed bitmasks from memmap
+        # Populate columnar bitsets
+        if consistent_count > 0:
+            self.columnar.add_documents(0, self.metadata_cache)
+
+        # Build in-memory 1-bit packed bitmasks & 2-bit scalar quantized index from memmap
         if consistent_count > 0 and self._memmap is not None:
-            # Vectorized bit-packing: 96 bytes per vector
             bitmask_list = []
+            sq2_list = []
             chunk_size = 10000
             for start in range(0, consistent_count, chunk_size):
                 end = min(start + chunk_size, consistent_count)
                 chunk_vecs = self._memmap[start:end]
                 bitmask_chunk = EmbeddingGemmaClient.quantize_1bit(chunk_vecs)
                 bitmask_list.append(bitmask_chunk)
+
+                mrl_256 = EmbeddingGemmaClient.truncate_mrl(chunk_vecs, dim=256)
+                sq2_chunk = ScalarQuantizer2Bit.quantize(mrl_256)
+                sq2_list.append(sq2_chunk)
+
             self.bitmask_index = np.vstack(bitmask_list)
+            self.sq2_index = np.vstack(sq2_list)
         else:
             self.bitmask_index = np.empty((0, self.PACKED_BYTES), dtype=np.uint8)
+            self.sq2_index = np.empty((0, ScalarQuantizer2Bit.PACKED_BYTES), dtype=np.uint8)
 
     def _remap_memmap(self, count: int) -> None:
         """Create or update np.memmap pointer."""
@@ -222,12 +241,21 @@ class StorageEngine:
         else:
             self.bitmask_index = np.vstack([self.bitmask_index, packed_batch])
 
+        mrl_batch_256 = EmbeddingGemmaClient.truncate_mrl(vectors, dim=256)
+        sq2_batch = ScalarQuantizer2Bit.quantize(mrl_batch_256)
+        if self.sq2_index.shape[0] == 0:
+            self.sq2_index = sq2_batch
+        else:
+            self.sq2_index = np.vstack([self.sq2_index, sq2_batch])
+
         for i, offset in enumerate(offsets):
             d_id = doc_ids[i]
             self.id_to_offset[d_id] = offset
             self.offset_to_id.append(d_id)
             self.offset_to_text.append(texts[i])
             self.metadata_cache.append(metadatas[i])
+
+        self.columnar.add_documents(start_offset, metadatas)
 
         # 4. Refresh memmap view
         self._remap_memmap(self.count)
@@ -277,7 +305,7 @@ class StorageEngine:
 
     def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
         """Fetch document text and metadata by ID."""
-        if doc_id not in self.id_to_offset:
+        if doc_id not in self.id_to_offset or self.segment_mgr.is_deleted(doc_id):
             return None
         idx = self.id_to_offset[doc_id]
         return {
@@ -286,6 +314,38 @@ class StorageEngine:
             "metadata": self.metadata_cache[idx],
             "offset": idx,
         }
+
+    def delete(self, doc_id: str) -> bool:
+        """Atomically soft-delete a document."""
+        if doc_id not in self.id_to_offset or self.segment_mgr.is_deleted(doc_id):
+            return False
+
+        tx_id = self.wal.next_tx_id()
+        self.wal.begin_transaction(tx_id, 1)
+        self.wal.log_delete(tx_id, doc_id)
+        self.wal.commit_transaction(tx_id)
+        return self.segment_mgr.mark_deleted(doc_id)
+
+    def compact(self) -> int:
+        """Perform physical storage compaction: purge tombstones and rewrite clean files."""
+        if self._memmap is not None:
+            if hasattr(self._memmap, "_mmap") and self._memmap._mmap is not None:
+                try:
+                    self._memmap._mmap.close()
+                except Exception:
+                    pass
+            self._memmap = None
+
+        purged = self.segment_mgr.compact(
+            vectors_path=self.vectors_path,
+            metadata_path=self.metadata_path,
+            bytes_per_vector=self.BYTES_PER_VECTOR,
+        )
+
+        # Reset WAL and re-initialize consistent structures
+        self.wal.checkpoint()
+        self._recover_and_initialize()
+        return purged
 
     def checkpoint(self) -> None:
         """Checkpoint WAL log to reduce disk footprint."""
