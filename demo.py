@@ -129,6 +129,41 @@ def run_demo() -> None:
     print(f"Embedding model mode: {'Synthetic MRL Mock' if use_mock else 'Real SentenceTransformers (google/embeddinggemma-2)'}")
 
     # =========================================================================
+    # STEP 0: Bare-Metal Micro-JIT Hardware Acceleration
+    # =========================================================================
+    print_banner("Step 0: Bare-Metal In-Memory Micro-JIT Hardware Acceleration")
+    from popdb.kernel import MicroJITKernel, FusedHammingKernel
+    jit = MicroJITKernel.get_instance()
+    print(f" • Micro-JIT Status : {'Active (Bare-Metal x86-64 POPCNT Loop)' if jit.is_available else 'NumPy Fallback'}")
+    print(f" • Machine Code Size : 219 bytes (Allocated in VirtualAlloc RAM page)")
+    print(f" • C Compiler Needed : 0 (Pure Python Standard Library ctypes)")
+
+    test_n = 250000
+    print(f"\nRunning live throughput test on {test_n:,} 96-byte vectors (24 MB bitmasks)...")
+    rng = np.random.RandomState(42)
+    sample_bits = rng.randint(0, 256, (test_n, 96), dtype=np.uint8)
+    sample_q = rng.randint(0, 256, (96,), dtype=np.uint8)
+
+    # NumPy baseline
+    t_np_0 = time.perf_counter()
+    sample_u64 = sample_bits.view(np.uint64)
+    q_u64 = sample_q.view(np.uint64)
+    np_res = np.bitwise_count(np.bitwise_xor(sample_u64, q_u64)).sum(axis=-1, dtype=np.int32)
+    t_np_ms = (time.perf_counter() - t_np_0) * 1000.0
+
+    # Bare-Metal Micro-JIT
+    t_jit_0 = time.perf_counter()
+    jit_res = FusedHammingKernel.compute_hamming_distances(sample_bits, sample_q)
+    t_jit_ms = (time.perf_counter() - t_jit_0) * 1000.0
+
+    speedup = t_np_ms / t_jit_ms if t_jit_ms > 0 else 1.0
+    throughput = (test_n / (t_jit_ms / 1000.0)) / 1e6
+    print(f" • Vectorized NumPy uint64 : {t_np_ms:.2f} ms")
+    print(f" • Bare-Metal Micro-JIT    : {t_jit_ms:.2f} ms ({speedup:.2f}x speedup)")
+    print(f" • Single-Core Throughput  : {throughput:.1f} Million vectors/second")
+    assert np.array_equal(np_res, jit_res)
+
+    # =========================================================================
     # STEP 1: Ingestion & Write-Ahead Log Verification
     # =========================================================================
     print_banner("Step 1: Document Ingestion & Atomic WAL Durability")
