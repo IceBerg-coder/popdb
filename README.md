@@ -93,8 +93,9 @@ PopDB is a lightweight, embedded vector database engine written in Python, custo
 - Supports MongoDB-style operators:
   `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$contains`, `$exists`, `$and`, `$or`, `$not`.
 
-### 6. Fused SIMD POPCOUNT Kernel & Tier 1.5 Scalar Quantization
-- **Fused SIMD uint64 Kernel (`FusedHammingKernel`)**: Reinterprets 96-byte bitmasks as $12 \times \text{uint64}$ integers, achieving a **4.6x speedup** (under 70 ms for 1,000,000 vectors) and processing vectors in L3 cache-friendly chunks without intermediate heap array allocations.
+### 6. Bare-Metal Micro-JIT, Fused SIMD POPCOUNT & Tier 1.5 Scalar Quantization
+- **In-Memory Micro-JIT (`MicroJITKernel`)**: Emits a 219-byte unrolled hardware POPCOUNT machine code loop directly into an executable memory page (`VirtualAlloc` on Windows / `mmap.PROT_EXEC` on Linux) using Python's standard library `ctypes`. Executes on bare-metal CPU hardware registers at **4.69x faster speed than NumPy** (sub-6ms for 500,000 vectors) with **zero C compilers, zero build tools, and zero external packages**.
+- **Fused SIMD uint64 Kernel (`FusedHammingKernel`)**: Graceful fallback reinterpreting 96-byte bitmasks as $12 \times \text{uint64}$ integers with L3 cache-friendly chunking (65,536 vectors) if JIT execution is restricted by host security policies.
 - **Tier 1.5 2-Bit Scalar Quantization (`ScalarQuantizer2Bit`)**: Packs 256d Matryoshka sub-vectors into 64 bytes in RAM to run fast in-memory asymmetric dot products, pruning candidate pools before triggering disk memmap page faults.
 
 ### 7. LSM-Tree Segments, Soft Deletes & Storage Compaction

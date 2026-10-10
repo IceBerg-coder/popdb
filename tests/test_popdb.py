@@ -327,7 +327,7 @@ class TestOptimizationModules:
         assert mask_tag.tolist() == [False, True, False]
 
     def test_fused_hamming_kernel(self):
-        from popdb.kernel import FusedHammingKernel
+        from popdb.kernel import FusedHammingKernel, MicroJITKernel
         rng = np.random.RandomState(42)
         docs = rng.randint(0, 256, size=(100, 96), dtype=np.uint8)
         query = rng.randint(0, 256, size=(96,), dtype=np.uint8)
@@ -336,7 +336,15 @@ class TestOptimizationModules:
         xor_expected = np.bitwise_xor(docs, query)
         expected_dists = np.bitwise_count(xor_expected).sum(axis=-1)
 
-        # Fused kernel
+        # Micro-JIT direct verification
+        jit = MicroJITKernel.get_instance()
+        assert isinstance(jit.is_available, bool)
+        if jit.is_available:
+            out_jit = np.zeros(100, dtype=np.int32)
+            jit.compute(docs, query, out_jit)
+            np.testing.assert_array_equal(out_jit, expected_dists)
+
+        # Fused kernel (transparently utilizes JIT if available)
         actual_dists = FusedHammingKernel.compute_hamming_distances(docs, query)
         np.testing.assert_array_equal(actual_dists, expected_dists)
 

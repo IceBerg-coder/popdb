@@ -7,7 +7,7 @@ from popdb.concurrency import RWLock
 from popdb.engine import Engine
 from popdb.filter import MetadataFilter
 from popdb.ivf import IVFBQIndex
-from popdb.kernel import FusedHammingKernel
+from popdb.kernel import FusedHammingKernel, MicroJITKernel
 from popdb.prefetch import OSMemoryPrefetcher
 from popdb.quantization import ScalarQuantizer2Bit
 from popdb.retriever import HierarchicalRetriever
@@ -21,6 +21,7 @@ __all__ = [
     "BM25Index",
     "ColumnarIndex",
     "FusedHammingKernel",
+    "MicroJITKernel",
     "ScalarQuantizer2Bit",
     "IVFBQIndex",
     "OSMemoryPrefetcher",
