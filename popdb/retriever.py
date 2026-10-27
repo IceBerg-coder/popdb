@@ -74,7 +74,7 @@ class HierarchicalRetriever:
 
         # Apply tombstone soft-delete mask
         if self.storage.segment_mgr.tombstones:
-            mask &= self.storage.segment_mgr.get_active_mask(self.storage.offset_to_id)
+            mask &= self.storage.segment_mgr.get_active_mask(n_physical)
 
         # Apply IVF Voronoi cluster probing mask if trained
         if use_ivf and self.storage.ivf.is_trained:
@@ -224,6 +224,31 @@ class HierarchicalRetriever:
 
         return final_results, stats
 
+    def search_bm25(
+        self,
+        query_text: str,
+        top_k: int = 10,
+        filter_predicate: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[int, float]]:
+        """BM25 keyword search over live documents, with metadata pushdown.
+
+        Returns:
+            List of (row_offset, bm25_score) tuples, best first.
+        """
+        candidate_set: Optional[Set[int]] = None
+        if filter_predicate or self.storage.segment_mgr.tombstones:
+            n_tot = len(self.storage.offset_to_id)
+            mask = np.ones(n_tot, dtype=bool)
+            if filter_predicate:
+                col_mask = self.storage.columnar.evaluate_mask(filter_predicate)
+                if col_mask is not None:
+                    mask &= col_mask
+            if self.storage.segment_mgr.tombstones:
+                mask &= self.storage.segment_mgr.get_active_mask(n_tot)
+            candidate_set = set(np.flatnonzero(mask).tolist())
+
+        return self.bm25.search(query=query_text, candidate_indices=candidate_set, top_k=top_k)
+
     def search_hybrid(
         self,
         query_text: str,
@@ -274,23 +299,7 @@ class HierarchicalRetriever:
         )
 
         # 2. Run BM25 search with metadata pushdown and tombstones
-        candidate_set: Optional[Set[int]] = None
-        if filter_predicate or self.storage.segment_mgr.tombstones:
-            n_tot = len(self.storage.offset_to_id)
-            mask = np.ones(n_tot, dtype=bool)
-            if filter_predicate:
-                col_mask = self.storage.columnar.evaluate_mask(filter_predicate)
-                if col_mask is not None:
-                    mask &= col_mask
-            if self.storage.segment_mgr.tombstones:
-                mask &= self.storage.segment_mgr.get_active_mask(self.storage.offset_to_id)
-            candidate_set = set(np.flatnonzero(mask).tolist())
-
-        bm25_matches = self.bm25.search(
-            query=query_text,
-            candidate_indices=candidate_set,
-            top_k=bm25_top_k,
-        )
+        bm25_matches = self.search_bm25(query_text, top_k=bm25_top_k, filter_predicate=filter_predicate)
 
         # 3. Reciprocal Rank Fusion aggregation
         # doc_id -> {dense_rank, sparse_rank, dense_score, sparse_score}

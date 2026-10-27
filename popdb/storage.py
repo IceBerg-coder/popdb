@@ -29,7 +29,7 @@ class StorageEngine:
     - prefetcher: OS-level asynchronous page prefetcher (PrefetchVirtualMemory / madvise).
     - columnar: High-performance Columnar Inverted Bitset Index for microsecond metadata filtering.
     - metadata_cache: List of metadata dicts for predicate pushdown evaluation.
-    - id_to_offset: Map of document string IDs to contiguous row indices.
+    - id_to_offset: Map of live (non-deleted) document IDs to contiguous row indices.
     """
 
     VECTOR_DIM = 768
@@ -107,8 +107,15 @@ class StorageEngine:
         # 4. Check WAL for committed records that need replay
         wal_committed = self.wal.recover()
         if wal_committed:
-            existing_ids = {r["id"] for r in metadata_records}
-            to_append = [rec for rec in wal_committed if rec[0] not in existing_ids]
+            base = self.wal.checkpoint_base
+            if base is not None:
+                # Committed inserts map positionally onto rows base, base+1, ...; replay the tail
+                # the data files are missing. (IDs can repeat once a deleted ID is re-inserted.)
+                to_append = wal_committed[max(0, consistent_count - base):]
+            else:
+                # Legacy WAL without a checkpoint record: fall back to matching by ID
+                existing_ids = {r["id"] for r in metadata_records}
+                to_append = [rec for rec in wal_committed if rec[0] not in existing_ids]
             if to_append:
                 # Replay missing committed records
                 with open(self.vectors_path, "ab") as vf, open(self.metadata_path, "a", encoding="utf-8") as mf:
@@ -133,14 +140,23 @@ class StorageEngine:
         self.id_to_offset.clear()
         self.metadata_cache.clear()
 
-        for idx, rec in enumerate(metadata_records):
-            doc_id = rec["id"]
-            self.id_to_offset[doc_id] = idx
-            self.offset_to_id.append(doc_id)
+        for rec in metadata_records:
+            self.offset_to_id.append(rec["id"])
             self.offset_to_text.append(rec.get("text", ""))
             self.metadata_cache.append(rec.get("metadata", {}))
 
-        # Populate columnar bitsets
+        # id_to_offset only maps live rows, so a deleted-then-reinserted ID resolves to its new row
+        self.segment_mgr.resolve_legacy_tombstones(self.offset_to_id)
+        for idx, doc_id in enumerate(self.offset_to_id):
+            if not self.segment_mgr.is_deleted(idx):
+                self.id_to_offset[doc_id] = idx
+
+        # Data files now hold every committed insert; start a positional WAL if this one predates it
+        if self.wal.checkpoint_base is None:
+            self.wal.checkpoint(base_rows=consistent_count)
+
+        # Populate columnar bitsets (fresh index: offsets may have shifted after compaction)
+        self.columnar = ColumnarIndex()
         if consistent_count > 0:
             self.columnar.add_documents(0, self.metadata_cache)
 
@@ -205,6 +221,13 @@ class StorageEngine:
         n = len(doc_ids)
         if n == 0:
             return []
+
+        # Reject duplicate IDs before anything is logged, so a failed batch leaves no trace
+        if len(set(doc_ids)) != n:
+            raise ValueError("Duplicate document IDs within the batch")
+        existing = [d for d in doc_ids if d in self.id_to_offset]
+        if existing:
+            raise ValueError(f"Document ID(s) already exist: {existing[:5]}")
 
         vectors = np.ascontiguousarray(vectors, dtype=np.float32)
 
@@ -308,7 +331,7 @@ class StorageEngine:
 
     def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
         """Fetch document text and metadata by ID."""
-        if doc_id not in self.id_to_offset or self.segment_mgr.is_deleted(doc_id):
+        if doc_id not in self.id_to_offset:
             return None
         idx = self.id_to_offset[doc_id]
         return {
@@ -330,8 +353,8 @@ class StorageEngine:
         if n_physical == 0 or self._memmap is None:
             return
         active_offsets = [
-            off for off, doc_id in enumerate(self.offset_to_id)
-            if not self.segment_mgr.is_deleted(doc_id)
+            off for off in range(n_physical)
+            if not self.segment_mgr.is_deleted(off)
         ]
         if not active_offsets:
             return
@@ -341,7 +364,7 @@ class StorageEngine:
 
     def delete(self, doc_id: str) -> bool:
         """Atomically soft-delete a document."""
-        if doc_id not in self.id_to_offset or self.segment_mgr.is_deleted(doc_id):
+        if doc_id not in self.id_to_offset:
             return False
 
         idx = self.id_to_offset[doc_id]
@@ -351,7 +374,8 @@ class StorageEngine:
         self.wal.commit_transaction(tx_id)
         if self.ivf.is_trained:
             self.ivf.remove(idx)
-        return self.segment_mgr.mark_deleted(doc_id)
+        del self.id_to_offset[doc_id]
+        return self.segment_mgr.mark_deleted(idx)
 
     def compact(self) -> int:
         """Perform physical storage compaction: purge tombstones and rewrite clean files."""
@@ -370,13 +394,17 @@ class StorageEngine:
         )
 
         # Reset WAL and re-initialize consistent structures
-        self.wal.checkpoint()
+        self.wal.checkpoint(base_rows=os.path.getsize(self.vectors_path) // self.BYTES_PER_VECTOR)
         self._recover_and_initialize()
+
+        # Row offsets changed, so the IVF cluster lists are stale: retrain if it was in use
+        if purged and self.ivf.is_trained:
+            self.build_ivf(k=self.ivf.k, n_probe=self.ivf.n_probe)
         return purged
 
     def checkpoint(self) -> None:
         """Checkpoint WAL log to reduce disk footprint."""
-        self.wal.checkpoint()
+        self.wal.checkpoint(base_rows=len(self.offset_to_id))
 
     def close(self) -> None:
         """Safely flush and release all file descriptors and memory mappings."""

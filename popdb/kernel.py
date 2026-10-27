@@ -99,9 +99,10 @@ class MicroJITKernel:
                 buf.seek(0)
                 self._mmap_buf = buf
 
-                # Get pointer to buffer
-                ptr = ctypes.c_void_p.from_buffer(buf)
-                self._ptr = ptr.value
+                # Address of the buffer itself. (c_void_p.from_buffer would instead read the
+                # first 8 code bytes as a pointer value and jump to garbage.)
+                self._code_anchor = ctypes.c_char.from_buffer(buf)
+                self._ptr = ctypes.addressof(self._code_anchor)
                 fn_type = ctypes.CFUNCTYPE(
                     None,
                     ctypes.c_void_p,

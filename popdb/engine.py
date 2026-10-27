@@ -371,17 +371,8 @@ class Engine:
         filter: Optional[Dict[str, Any]] = None,
     ) -> List[SearchResult]:
         """Perform pure BM25 keyword search with metadata pre-filtering."""
-        from popdb.filter import MetadataFilter
         with self.rwlock.read_lock():
-            candidate_set = None
-            if filter:
-                eligible_list = MetadataFilter.filter_indices(
-                    self.storage.metadata_cache,
-                    filter,
-                )
-                candidate_set = set(eligible_list)
-
-            matches = self.bm25.search(query, candidate_indices=candidate_set, top_k=top_k)
+            matches = self.retriever.search_bm25(query, top_k=top_k, filter_predicate=filter)
             results = []
             for offset, score in matches:
                 doc_id = self.storage.offset_to_id[offset]

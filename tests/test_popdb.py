@@ -453,3 +453,149 @@ class TestOptimizationModules:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+
+
+class TestRegressions:
+    """Regression tests for previously broken engine and kernel behaviour."""
+
+    @staticmethod
+    def _docs(n, prefix="doc"):
+        return [f"{prefix} {i} about vectors" for i in range(n)], [f"{prefix}_{i}" for i in range(n)]
+
+    def test_jit_pointer_targets_emitted_code(self):
+        # On POSIX the function pointer was read *from* the code bytes instead of pointing *at*
+        # them, so the first call jumped to garbage and segfaulted (Linux CI).
+        import ctypes
+        from popdb.kernel import MicroJITKernel
+
+        jit = MicroJITKernel.get_instance()
+        if not jit.is_available:
+            pytest.skip("Micro-JIT not available on this platform")
+        assert ctypes.string_at(jit._ptr, jit._size) == jit._assemble_kernel()
+
+    def test_duplicate_ids_rejected(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with Engine(temp_dir, use_mock_client=True) as db:
+                db.insert("alpha cats", doc_id="x")
+                with pytest.raises(ValueError):
+                    db.insert("beta dogs", doc_id="x")
+                with pytest.raises(ValueError):
+                    db.insert_batch(["one", "two"], doc_ids=["y", "y"])
+                assert db.count() == 1
+                assert db.get("x")["text"] == "alpha cats"
+                assert [r.id for r in db.search("alpha cats", top_k=5)] == ["x"]
+
+            # Rejected batches must leave nothing behind for WAL replay to resurrect
+            with Engine(temp_dir, use_mock_client=True) as db:
+                assert db.count() == 1
+                assert db.get("y") is None
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_reinsert_after_delete(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with Engine(temp_dir, use_mock_client=True) as db:
+                db.insert("old version", doc_id="x")
+                db.insert("other doc", doc_id="y")
+                assert db.delete("x")
+                db.insert("new version", doc_id="x")
+
+                assert db.count() == 2
+                assert db.get("x")["text"] == "new version"
+                hits = [r for r in db.search("anything", top_k=10) if r.id == "x"]
+                assert [r.text for r in hits] == ["new version"]
+
+            with Engine(temp_dir, use_mock_client=True) as db:
+                assert db.count() == 2
+                assert db.get("x")["text"] == "new version"
+                assert db.compact() == 1
+                assert db.count() == 2
+                assert db.get("x")["text"] == "new version"
+                assert db.delete("x")
+                assert db.get("x") is None
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_wal_replays_reinsert_missing_from_data_files(self):
+        # Crash after the WAL commit but before the data-file write: the re-inserted row must be
+        # replayed even though a (deleted) row with the same ID is already on disk.
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with Engine(temp_dir, use_mock_client=True) as db:
+                db.insert("old version", doc_id="x")
+                db.delete("x")
+                db.insert("new version", doc_id="x")
+
+            vec_path = os.path.join(temp_dir, "vectors.bin")
+            meta_path = os.path.join(temp_dir, "metadata.jsonl")
+            with open(vec_path, "r+b") as f:
+                f.truncate(os.path.getsize(vec_path) - 768 * 4)
+            with open(meta_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            with open(meta_path, "w", encoding="utf-8") as f:
+                f.writelines(lines[:-1])
+
+            with Engine(temp_dir, use_mock_client=True) as db:
+                assert db.count() == 1
+                assert db.get("x")["text"] == "new version"
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_legacy_id_tombstones_still_hide_rows(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with Engine(temp_dir, use_mock_client=True) as db:
+                db.insert_batch(["keep me", "drop me"], doc_ids=["a", "b"])
+            # Databases written before offset tombstones stored doc IDs
+            with open(os.path.join(temp_dir, "tombstones.json"), "w", encoding="utf-8") as f:
+                f.write('["b"]')
+
+            with Engine(temp_dir, use_mock_client=True) as db:
+                assert db.count() == 1
+                assert db.get("b") is None
+                assert [r.id for r in db.search("drop me", top_k=5)] == ["a"]
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_bm25_search_excludes_deleted(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with Engine(temp_dir, use_mock_client=True) as db:
+                db.insert_batch(
+                    ["postgres wal durability", "postgres replication", "cats and dogs"],
+                    doc_ids=["a", "b", "c"],
+                    metadatas=[{"k": 1}, {"k": 2}, {"k": 1}],
+                )
+                db.delete("a")
+                assert [r.id for r in db.search_bm25("postgres wal")] == ["b"]
+                assert db.search_bm25("postgres wal", filter={"k": 1}) == []
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_compact_after_build_ivf(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with Engine(temp_dir, use_mock_client=True) as db:
+                texts, ids = self._docs(200)
+                metas = [{"even": i % 2 == 0} for i in range(200)]
+                db.insert_batch(texts, doc_ids=ids, metadatas=metas)
+                db.build_ivf(k=4, n_probe=2)
+                for i in range(150):
+                    db.delete(f"doc_{i}")
+
+                assert db.compact() == 150
+                assert db.count() == 50
+                assert db.storage.ivf.is_trained
+
+                live = {f"doc_{i}" for i in range(150, 200)}
+                results = db.search("doc about vectors", top_k=10)
+                assert results and all(r.id in live for r in results)
+
+                # Metadata bitsets must be rebuilt for the new row offsets too
+                filtered = db.search("doc about vectors", top_k=50, filter={"even": True}, use_ivf=False)
+                assert len(filtered) == 25
+                assert all(r.metadata["even"] is True and r.id in live for r in filtered)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)

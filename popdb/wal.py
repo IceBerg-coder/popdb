@@ -47,6 +47,9 @@ class WALManager:
         self.wal_path = wal_path
         self._file = None
         self._current_tx_id = 0
+        # Row count of the data files when the WAL was last checkpointed (set by recover()).
+        # Committed inserts after it map to rows base, base+1, ... in order. None = legacy WAL.
+        self.checkpoint_base: Optional[int] = None
         self._init_wal_file()
 
     def _init_wal_file(self) -> None:
@@ -164,8 +167,12 @@ class WALManager:
         payload = struct.pack(">Q", tx_id)
         self._write_record(tx_id, WALRecordType.COMMIT, payload)
 
-    def checkpoint(self) -> None:
-        """Log checkpoint and truncate WAL file back to header."""
+    def checkpoint(self, base_rows: int) -> None:
+        """Truncate WAL file back to header and log a checkpoint of the data files' row count.
+
+        Args:
+            base_rows: Number of rows durably stored in vectors.bin / metadata.jsonl.
+        """
         if self._file:
             self._file.close()
 
@@ -175,6 +182,8 @@ class WALManager:
             os.fsync(f.fileno())
 
         self._file = open(self.wal_path, "a+b")
+        self._write_record(self._current_tx_id, WALRecordType.CHECKPOINT, struct.pack(">Q", base_rows))
+        self.checkpoint_base = base_rows
 
     def read_all_records(self) -> Iterator[Tuple[int, int, bytes]]:
         """Scan WAL file and yield validated (tx_id, op_type, payload) tuples."""
@@ -244,10 +253,13 @@ class WALManager:
         committed_tx_ids = set()
         transactions: Dict[int, List[bytes]] = {}
         max_tx_id = 0
+        self.checkpoint_base = None
 
         for tx_id, op_type, payload in self.read_all_records():
             max_tx_id = max(max_tx_id, tx_id)
-            if op_type == WALRecordType.BEGIN:
+            if op_type == WALRecordType.CHECKPOINT:
+                self.checkpoint_base, = struct.unpack(">Q", payload)
+            elif op_type == WALRecordType.BEGIN:
                 transactions[tx_id] = []
             elif op_type == WALRecordType.INSERT:
                 if tx_id not in transactions:
