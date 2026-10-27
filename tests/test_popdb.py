@@ -1,5 +1,6 @@
 """Comprehensive unit and integration tests for PopDB."""
 
+import importlib.util
 import os
 import shutil
 import tempfile
@@ -16,6 +17,10 @@ from popdb import (
     WALManager,
 )
 from popdb.wal import WALRecordType
+
+# EmbeddingGemma 2 ships image/video processors, so loading it needs torchvision and Pillow too
+_REAL_MODEL_DEPS = ("sentence_transformers", "torch", "torchvision", "PIL")
+_MISSING_MODEL_DEPS = [m for m in _REAL_MODEL_DEPS if importlib.util.find_spec(m) is None]
 
 
 class TestEmbeddingGemmaClient:
@@ -58,6 +63,10 @@ class TestEmbeddingGemmaClient:
         np.testing.assert_allclose(np.linalg.norm(doc_embs, axis=-1), 1.0, atol=1e-5)
         np.testing.assert_allclose(np.linalg.norm(query_emb), 1.0, atol=1e-5)
 
+    @pytest.mark.skipif(
+        bool(_MISSING_MODEL_DEPS),
+        reason=f"real model needs missing packages: {', '.join(_MISSING_MODEL_DEPS)}",
+    )
     def test_real_embeddinggemma_model(self):
         """Test actual google/embeddinggemma-2 model inference with Document & SearchQuery prompts."""
         client = EmbeddingGemmaClient(
