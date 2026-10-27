@@ -94,7 +94,7 @@ PopDB is a lightweight, embedded vector database engine written in Python, custo
   `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$contains`, `$exists`, `$and`, `$or`, `$not`.
 
 ### 6. Bare-Metal Micro-JIT, Fused SIMD POPCOUNT & Tier 1.5 Scalar Quantization
-- **In-Memory Micro-JIT (`MicroJITKernel`)**: Emits a 219-byte unrolled hardware POPCOUNT machine code loop directly into an executable memory page (`VirtualAlloc` on Windows / `mmap.PROT_EXEC` on Linux) using Python's standard library `ctypes`. Executes on bare-metal CPU hardware registers at **4.69x faster speed than NumPy** (sub-6ms for 500,000 vectors) with **zero C compilers, zero build tools, and zero external packages**.
+- **In-Memory Micro-JIT (`MicroJITKernel`)**: Emits a 219-byte unrolled hardware POPCOUNT machine code loop directly into an executable memory page (`VirtualAlloc` on Windows / `mmap.PROT_EXEC` on Linux) using Python's standard library `ctypes`. Executes on bare-metal CPU hardware registers at **roughly 4.5–7x the speed of NumPy** depending on CPU (e.g. 2.4 ms vs 16.5 ms for 250,000 vectors; run `demo.py` to measure on your machine) with **zero C compilers, zero build tools, and zero external packages**.
 - **Fused SIMD uint64 Kernel (`FusedHammingKernel`)**: Graceful fallback reinterpreting 96-byte bitmasks as $12 \times \text{uint64}$ integers with L3 cache-friendly chunking (65,536 vectors) if JIT execution is restricted by host security policies.
 - **Tier 1.5 2-Bit Scalar Quantization (`ScalarQuantizer2Bit`)**: Packs 256d Matryoshka sub-vectors into 64 bytes in RAM to run fast in-memory asymmetric dot products, pruning candidate pools before triggering disk memmap page faults.
 
@@ -114,6 +114,26 @@ PopDB is a lightweight, embedded vector database engine written in Python, custo
 - **Bulk Ingestion (`bulk_insert`)**: Batches embeddings and WAL frames, executing a single fsync barrier per batch for throughput exceeding 10,000 docs/sec.
 - **Readers-Writer Lock (`RWLock`)**: Writer-priority concurrent locking allowing multiple simultaneous search threads alongside thread-safe writes.
 - **Concurrent Batch Search (`batch_search`)**: Vectorized query embedding + parallel cascade search across CPU worker threads via `ThreadPoolExecutor`.
+
+---
+
+## Installation
+
+Requires Python 3.10+. From the repository root:
+
+```bash
+pip install -e .[dev]
+```
+
+This installs PopDB with its runtime dependencies (`numpy`, `sentence-transformers`, `torch`, `torchvision`, `Pillow`) plus `pytest`. EmbeddingGemma 2 ships image and video processors, so `torchvision` and `Pillow` are required to load the model even for text-only embedding.
+
+For a CPU-only machine, install the CPU builds of `torch` and `torchvision` first to avoid the much larger CUDA wheels:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+```
+
+The first run downloads `google/embeddinggemma-2` from Hugging Face. To try PopDB without the model, use mock embeddings (`Engine(..., use_mock_client=True)` or `python demo.py --mock`).
 
 ---
 
@@ -167,6 +187,8 @@ with Engine("./my_vector_db") as db:
 ```bash
 python demo.py
 ```
+This needs the model dependencies from [Installation](#installation); the demo checks for them and exits with instructions if any are missing.
+
 Or with synthetic mock embeddings (offline mode):
 ```bash
 python demo.py --mock
@@ -176,6 +198,7 @@ python demo.py --mock
 ```bash
 python -m pytest tests/test_popdb.py -v
 ```
+The real-model test is skipped automatically when the model dependencies aren't installed.
 
 ---
 

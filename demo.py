@@ -10,6 +10,7 @@ Showcases:
 7. Cold Restart, Disk Persistence & WAL Replay Verification.
 """
 
+import importlib.util
 import os
 import shutil
 import sys
@@ -124,6 +125,22 @@ def run_demo() -> None:
     use_mock = "--mock" in sys.argv
     model_name = "google/embeddinggemma-2"
     device = "cpu"
+
+    # EmbeddingGemma 2 ships image/video processors, so loading it needs torchvision and Pillow too
+    if not use_mock:
+        model_deps = {
+            "sentence_transformers": "sentence-transformers",
+            "torch": "torch",
+            "torchvision": "torchvision",
+            "PIL": "Pillow",
+        }
+        missing = [pkg for mod, pkg in model_deps.items() if importlib.util.find_spec(mod) is None]
+        if missing:
+            print(f"\n[ERROR] The real {model_name} model needs packages that aren't installed: {', '.join(missing)}")
+            print(f"  Install them:  pip install {' '.join(missing)}")
+            print("  (CPU-only: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu)")
+            print("  Or run offline with synthetic embeddings:  python demo.py --mock")
+            sys.exit(1)
 
     print(f"\nInitializing PopDB Engine at: {demo_db_path}")
     print(f"Embedding model mode: {'Synthetic MRL Mock' if use_mock else 'Real SentenceTransformers (google/embeddinggemma-2)'}")
